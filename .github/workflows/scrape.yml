@@ -1,4 +1,4 @@
-name: dcinside-krstock-backtest-scraper
+name: dcinside-kospi-backtest-scraper
 
 on:
   workflow_dispatch:
@@ -35,7 +35,7 @@ jobs:
 
       - name: Run scraper
         env:
-          BOARD_ID: "krstock"
+          BOARD_ID: "kospi"
           DATES_FILE: "date.txt"
           TARGET_DATE: ${{ inputs.target_date }}
           START_TIME: ${{ inputs.start_time }}
@@ -51,5 +51,5 @@ jobs:
       - name: Upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: krstock_csv_outputs
+          name: kospi_csv_outputs
           path: outputs/
