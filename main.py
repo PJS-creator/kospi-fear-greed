@@ -1,4 +1,3 @@
-# main.py
 import os
 import re
 import csv
@@ -6,7 +5,7 @@ import time
 import random
 from dataclasses import dataclass
 from datetime import datetime, date, time as dtime
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Set
 from urllib.parse import urlsplit, urlunsplit, parse_qs, urlencode, urljoin
 
 import requests
@@ -34,6 +33,7 @@ DATES_FILE = os.getenv("DATES_FILE", "date.txt")
 # 페이지/부하 제어
 LIST_NUM = int(os.getenv("LIST_NUM", "100"))  # 30/50/100 중 하나(기본 100 추천)
 MAX_PAGE_LIMIT = int(os.getenv("MAX_PAGE_LIMIT", "20000"))  # 안전 상한
+START_PAGE_BACKTRACK = int(os.getenv("START_PAGE_BACKTRACK", "15"))  # 활발한 갤러리는 페이지가 빨리 밀리므로 여유분 확보
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
@@ -145,7 +145,7 @@ def fetch_html(session: requests.Session, url: str, referer: Optional[str] = Non
 
 def extract_open_date_from_list(html: str) -> Optional[date]:
     """
-    리스트 페이지 텍스트에서 '개설일 2025-05-19' 추출
+    리스트 페이지 텍스트에서 '개설일 2020-02-11' 추출
     """
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(" ", strip=True)
@@ -277,7 +277,7 @@ def parse_list_date_or_datetime(
     """
     (dt, d) 반환:
     - dt: 시간까지 확정된 경우 (오늘 HH:MM, 혹은 attr로 전체 timestamp 확보)
-    - d : 날짜만 아는 경우 (YY.MM.DD 또는 MM.DD 등)
+    - d : 날짜만 아는 경우 (YY.MM.DD / YYYY.MM.DD / MM.DD 등)
     """
     # 1) attr에 전체 timestamp가 있으면 최우선
     if date_attr:
@@ -297,14 +297,14 @@ def parse_list_date_or_datetime(
         yy, mo, d = map(int, s.split("."))
         return None, date(2000 + yy, mo, d)
 
-    # 4) YYYY.MM.DD (드물게 등장 가능)
+    # 4) YYYY.MM.DD
     if re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", s):
         try:
             return None, datetime.strptime(s, "%Y.%m.%d").date()
         except ValueError:
             return None, None
 
-    # 5) MM.DD (일부 환경에서 나올 수 있음) -> 올해 기준 + 롤오버 보정
+    # 5) MM.DD -> 올해 기준 + 롤오버 보정
     if re.fullmatch(r"\d{2}\.\d{2}", s):
         mo, d = map(int, s.split("."))
         y = now_kst.year
@@ -464,30 +464,29 @@ def find_start_page_for_date(
     return ans
 
 
-def scrape_one_date(
+def collect_candidate_rows_for_date(
     session: requests.Session,
     target: date,
-    start_t: dtime,
-    end_t: dtime,
     now_kst: datetime,
     start_page: int,
-) -> List[Tuple[datetime, str, str]]:
+) -> List[Tuple[PostRow, str, Optional[datetime]]]:
     """
-    start_page부터 순차 탐색.
-    - target 날짜인 글만 상세 시간 확인(필요할 때)
-    - target 날짜에서 작성시간이 start_t보다 이전이면 즉시 break
+    날짜가 target인 후보 글을 먼저 "리스트 페이지만" 빠르게 수집한다.
+    (활발한 갤러리는 상세 페이지를 중간중간 열면 페이지가 밀려서 글을 놓치기 쉬움)
+    반환값: (PostRow, referer_page_url, dt_guess)
     """
-    results: List[Tuple[datetime, str, str]] = []
-    done = False
-    post_dt_cache: Dict[str, datetime] = {}
+    candidates: List[Tuple[PostRow, str, Optional[datetime]]] = []
+    seen_post_no: Set[int] = set()
 
-    page = start_page
+    page = max(1, start_page)
     while page <= MAX_PAGE_LIMIT:
         page_url = build_list_url(page)
         html = fetch_html(session, page_url)
         rows = extract_rows(html, page_url)
         if not rows:
             break
+
+        page_has_target = False
 
         for r in rows:
             if r.is_notice:
@@ -502,39 +501,65 @@ def scrape_one_date(
                 continue
 
             if row_date < target:
-                done = True
-                break
+                return candidates
 
             # row_date == target
-            if dt_guess is None:
-                if r.url in post_dt_cache:
-                    dt = post_dt_cache[r.url]
-                else:
-                    jitter_sleep(SLEEP_POST)
-                    post_html = fetch_html(session, r.url, referer=page_url)
-                    dt = parse_datetime_from_post(post_html)
-                    if dt is None:
-                        continue
-                    post_dt_cache[r.url] = dt
-            else:
-                dt = dt_guess
+            page_has_target = True
+            if r.post_no in seen_post_no:
+                continue
+            seen_post_no.add(r.post_no)
+            candidates.append((r, page_url, dt_guess))
 
-            # tz-aware time 비교 문제 피하려고 tz 제거한 time으로 비교
-            t = dt.timetz().replace(tzinfo=None)
-
-            # ✅ 핵심 break: 08:50 이전으로 내려가면 더 볼 필요 없음
-            if t < start_t:
-                done = True
-                break
-
-            if start_t <= t <= end_t:
-                results.append((dt, r.title, r.url))
-
-        if done:
+        if not page_has_target and candidates:
+            # target 날짜를 이미 모았고, 현재 페이지엔 target이 하나도 없으면 종료
             break
 
         jitter_sleep(SLEEP_LIST)
         page += 1
+
+    return candidates
+
+
+def scrape_one_date(
+    session: requests.Session,
+    target: date,
+    start_t: dtime,
+    end_t: dtime,
+    now_kst: datetime,
+    start_page: int,
+) -> List[Tuple[datetime, str, str]]:
+    """
+    1) 리스트 페이지를 먼저 빠르게 훑어 target 날짜 후보를 모두 수집
+    2) 그 다음에 상세 페이지를 열어 정확한 시간을 확인
+    """
+    results: List[Tuple[datetime, str, str]] = []
+    post_dt_cache: Dict[str, datetime] = {}
+
+    candidates = collect_candidate_rows_for_date(
+        session=session,
+        target=target,
+        now_kst=now_kst,
+        start_page=start_page,
+    )
+    print(f"[INFO] {target} 후보 글 {len(candidates)}건 (start_page={start_page})")
+
+    for r, referer_page_url, dt_guess in candidates:
+        if dt_guess is None:
+            if r.url in post_dt_cache:
+                dt = post_dt_cache[r.url]
+            else:
+                jitter_sleep(SLEEP_POST)
+                post_html = fetch_html(session, r.url, referer=referer_page_url)
+                dt = parse_datetime_from_post(post_html)
+                if dt is None:
+                    continue
+                post_dt_cache[r.url] = dt
+        else:
+            dt = dt_guess
+
+        t = dt.timetz().replace(tzinfo=None)
+        if start_t <= t <= end_t:
+            results.append((dt, r.title, r.url))
 
     return results
 
@@ -576,7 +601,6 @@ def main():
         for d in requested_dates:
             out_path = os.path.join(OUT_DIR, f"kospi_{d.isoformat()}.csv")
             write_csv(out_path, [])
-        # 합본도 생성
         combined_path = os.path.join(OUT_DIR, "kospi_all.csv")
         with open(combined_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
@@ -584,25 +608,26 @@ def main():
         print("[DONE] 모든 날짜가 개설일 이전이라 빈 CSV만 생성했습니다.")
         return
 
-    # 4) 가장 과거 목표 날짜까지 도달하는 페이지 hi를 1번만 잡고, 각 날짜는 이진탐색
-    min_date = min(target_dates)
-    hi, cache = find_upper_bound_for_min_date(session, min_date, now_kst)
-    print(f"[INFO] 페이지 상한(hi) 추정: {hi} (min_target_date={min_date})")
-
-    # 5) 날짜별 수집(신규→과거 순)
+    # 4) 날짜별 수집(신규→과거 순)
+    #    kospi처럼 활발한 갤은 page cache를 오래 들고 있으면 금방 stale 되므로
+    #    날짜별로 fresh 하게 hi/start_page를 다시 계산한다.
     for target in sorted(target_dates, reverse=True):
-        start_page = find_start_page_for_date(session, target, now_kst, hi, cache)
-        print(f"\n=== {target} 시작 페이지: {start_page} ===")
-        rows = scrape_one_date(session, target, start_t, end_t, now_kst, start_page)
+        fresh_now_kst = datetime.now(KST)
+        hi, cache = find_upper_bound_for_min_date(session, target, fresh_now_kst)
+        raw_start_page = find_start_page_for_date(session, target, fresh_now_kst, hi, cache)
+        start_page = max(1, raw_start_page - START_PAGE_BACKTRACK)
+
+        print(f"\n=== {target} 시작 페이지(raw={raw_start_page}, adjusted={start_page}, hi={hi}) ===")
+        rows = scrape_one_date(session, target, start_t, end_t, fresh_now_kst, start_page)
         all_results_by_date[target] = rows
         print(f"[OK] {target} 수집 {len(rows)}건")
 
-    # 6) 날짜별 CSV 저장(요청된 날짜는 모두 생성)
+    # 5) 날짜별 CSV 저장(요청된 날짜는 모두 생성)
     for d in requested_dates:
         out_path = os.path.join(OUT_DIR, f"kospi_{d.isoformat()}.csv")
         write_csv(out_path, all_results_by_date.get(d, []))
 
-    # 7) 합본 CSV도 생성
+    # 6) 합본 CSV도 생성
     combined_path = os.path.join(OUT_DIR, "kospi_all.csv")
     combined_rows: List[Tuple[datetime, str, str, str]] = []
     for d in requested_dates:
