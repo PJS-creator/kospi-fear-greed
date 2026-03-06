@@ -4,21 +4,22 @@ on:
   workflow_dispatch:
     inputs:
       target_date:
-        description: "YYYY-MM-DD (비우면 date.txt 전체 날짜 실행)"
+        description: 'Single target date (YYYY-MM-DD). Leave blank to use date.txt'
         required: false
-        default: ""
+        default: ''
       start_time:
-        description: "HH:MM (KST)"
+        description: 'KST start time (HH:MM)'
         required: false
-        default: "08:50"
+        default: '08:50'
       end_time:
-        description: "HH:MM (KST)"
+        description: 'KST end time (HH:MM)'
         required: false
-        default: "15:40"
+        default: '15:40'
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,7 +27,7 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: |
@@ -40,18 +41,26 @@ jobs:
           TARGET_DATE: ${{ inputs.target_date }}
           START_TIME: ${{ inputs.start_time }}
           END_TIME: ${{ inputs.end_time }}
+          OUT_DIR: "outputs"
           LIST_NUM: "100"
-          SLEEP_LIST: "0.9"
-          SLEEP_POST: "0.6"
+          MAX_PAGE_LIMIT: "5000"
+          REQUEST_TIMEOUT: "20"
           MAX_RETRIES: "5"
-          TARGET_PAGE_SEARCH_RADIUS: "80"
-          PAGE_WINDOW_MARGIN: "25"
+          SLEEP_LIST: "0.25"
+          SLEEP_POST: "0.20"
+          EDGE_SAMPLE_SIZE: "20"
+          EDGE_OUTLIER_DAYS: "3"
+          STOP_OLDER_CONSECUTIVE_PAGES: "10"
+          PAGE_PROGRESS_EVERY: "10"
         run: |
           python main.py
-          ls -al outputs || true
+          echo ""
+          echo "[DEBUG] CSV 생성 결과"
+          ls -lah outputs || true
 
       - name: Upload CSV artifacts
         uses: actions/upload-artifact@v4
         with:
           name: kospi_csv_outputs
-          path: outputs/
+          path: outputs/*.csv
+          if-no-files-found: warn
