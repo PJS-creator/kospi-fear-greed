@@ -1,8 +1,10 @@
+# main.py
 import os
 import re
 import csv
 import time
 import random
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, date, time as dtime
 from typing import Optional, Tuple, List, Dict, Set
@@ -36,14 +38,15 @@ LIST_NUM = int(os.getenv("LIST_NUM", "100"))
 MAX_PAGE_LIMIT = int(os.getenv("MAX_PAGE_LIMIT", "20000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-SLEEP_LIST = float(os.getenv("SLEEP_LIST", "0.7"))
-SLEEP_POST = float(os.getenv("SLEEP_POST", "0.45"))
+SLEEP_LIST = float(os.getenv("SLEEP_LIST", "0.25"))
+SLEEP_POST = float(os.getenv("SLEEP_POST", "0.20"))
 OUT_DIR = os.getenv("OUT_DIR", "outputs")
 
-# kospi 같이 활발한 갤에서 경계 페이지를 안정적으로 포착하기 위한 여유값
-TARGET_PAGE_SEARCH_RADIUS = int(os.getenv("TARGET_PAGE_SEARCH_RADIUS", "80"))
-PAGE_WINDOW_MARGIN = int(os.getenv("PAGE_WINDOW_MARGIN", "25"))
-PAGE_WINDOW_MAX_EXPAND = int(os.getenv("PAGE_WINDOW_MAX_EXPAND", "200"))
+# 선형 스캔 종료 조건
+EDGE_SAMPLE_SIZE = int(os.getenv("EDGE_SAMPLE_SIZE", "20"))
+EDGE_OUTLIER_DAYS = int(os.getenv("EDGE_OUTLIER_DAYS", "3"))
+STOP_OLDER_CONSECUTIVE_PAGES = int(os.getenv("STOP_OLDER_CONSECUTIVE_PAGES", "10"))
+PAGE_PROGRESS_EVERY = int(os.getenv("PAGE_PROGRESS_EVERY", "10"))
 
 USER_AGENT = os.getenv(
     "USER_AGENT",
@@ -84,6 +87,8 @@ def parse_hhmm(s: str) -> dtime:
 
 
 def jitter_sleep(base: float) -> None:
+    if base <= 0:
+        return
     time.sleep(base + random.uniform(0, base * 0.35))
 
 
@@ -339,244 +344,179 @@ def write_csv(out_path: str, rows: List[Tuple[datetime, str, str]]) -> None:
             w.writerow([dt.strftime("%Y-%m-%d %H:%M:%S"), title, url])
 
 
-def get_page_date_range(
-    session: requests.Session,
-    page: int,
-    now_kst: datetime,
-    cache: Dict[int, Tuple[Optional[date], Optional[date]]],
-) -> Tuple[Optional[date], Optional[date]]:
-    """
-    페이지에서 (가장 최신 날짜, 가장 오래된 날짜)를 반환한다.
-    순서가 약간 흔들리더라도 max/min으로 계산해 경계 탐색을 안정화한다.
-    """
-    if page in cache:
-        return cache[page]
+def row_created_date(r: PostRow, now_kst: datetime) -> Tuple[Optional[datetime], Optional[date]]:
+    return parse_list_date_or_datetime(r.date_text, r.date_attr, now_kst)
 
-    url = build_list_url(page)
-    html = fetch_html(session, url)
-    rows = extract_rows(html, url)
 
-    d_list: List[date] = []
+def robust_page_main_range(rows: List[PostRow], now_kst: datetime) -> Tuple[Optional[date], Optional[date]]:
+    """
+    페이지는 대체로 최신→과거 순이지만, 중간에 오래된 글이 끼어드는 outlier가 존재한다.
+    따라서 page 전체 min/max를 쓰지 않고, 상단/하단 edge band의 대표 날짜를 사용한다.
+    """
+    row_dates: List[date] = []
     for r in rows:
         if r.is_notice:
             continue
-        dt, d = parse_list_date_or_datetime(r.date_text, r.date_attr, now_kst)
-        row_date = dt.date() if dt else d
-        if row_date:
-            d_list.append(row_date)
+        dt_guess, d_guess = row_created_date(r, now_kst)
+        rd = dt_guess.date() if dt_guess else d_guess
+        if rd is not None:
+            row_dates.append(rd)
 
-    if not d_list:
-        cache[page] = (None, None)
+    if not row_dates:
         return None, None
 
-    newest = max(d_list)
-    oldest = min(d_list)
-    cache[page] = (newest, oldest)
+    sample = max(5, min(EDGE_SAMPLE_SIZE, len(row_dates)))
+    top = row_dates[:sample]
+    bottom = row_dates[-sample:]
+
+    def _filter_band(ds: List[date]) -> List[date]:
+        ords = sorted(d.toordinal() for d in ds)
+        median_ord = ords[len(ords) // 2]
+        filtered = [d for d in ds if abs(d.toordinal() - median_ord) <= EDGE_OUTLIER_DAYS]
+        # 필터가 너무 빡세면 원본 사용
+        if len(filtered) < max(3, len(ds) // 2):
+            return ds
+        return filtered
+
+    top_filtered = _filter_band(top)
+    bottom_filtered = _filter_band(bottom)
+    newest = max(top_filtered)
+    oldest = min(bottom_filtered)
+
+    if newest < oldest:
+        newest, oldest = oldest, newest
     return newest, oldest
 
 
-def page_intersects_target(
+def scan_pages_for_targets(
     session: requests.Session,
-    page: int,
-    target: date,
+    target_dates: List[date],
+    requested_dates: List[date],
+    start_t: dtime,
+    end_t: dtime,
     now_kst: datetime,
-    cache: Dict[int, Tuple[Optional[date], Optional[date]]],
-) -> bool:
-    newest, oldest = get_page_date_range(session, page, now_kst, cache)
-    if newest is None or oldest is None:
-        return False
-    return newest >= target >= oldest
+) -> Dict[date, List[Tuple[datetime, str, str]]]:
+    results_by_date: Dict[date, List[Tuple[datetime, str, str]]] = {d: [] for d in requested_dates}
+    target_set: Set[date] = set(target_dates)
+    if not target_dates:
+        return results_by_date
 
+    oldest_target = min(target_dates)
+    newest_target = max(target_dates)
 
-def find_upper_bound_for_min_date(
-    session: requests.Session, min_date: date, now_kst: datetime
-) -> Tuple[int, Dict[int, Tuple[Optional[date], Optional[date]]]]:
-    cache: Dict[int, Tuple[Optional[date], Optional[date]]] = {}
+    seen_post_no_by_date: Dict[date, Set[int]] = defaultdict(set)
+    seen_url_by_date: Dict[date, Set[str]] = defaultdict(set)
+    post_dt_cache: Dict[str, datetime] = {}
+    candidate_count_by_date: Dict[date, int] = defaultdict(int)
 
-    hi = 1
-    while hi <= MAX_PAGE_LIMIT:
-        _newest, oldest = get_page_date_range(session, hi, now_kst, cache)
-        if oldest is None:
-            return hi, cache
-        if oldest <= min_date:
-            return hi, cache
-        hi *= 2
+    passed_oldest_target_zone = False
+    consecutive_pages_strictly_older = 0
 
-    return MAX_PAGE_LIMIT, cache
+    print(
+        f"[INFO] 선형 스캔 시작: target_dates={min(target_dates)}..{max(target_dates)}, "
+        f"stop_after_older_pages={STOP_OLDER_CONSECUTIVE_PAGES}"
+    )
 
-
-def find_start_page_for_date(
-    session: requests.Session,
-    target: date,
-    now_kst: datetime,
-    hi: int,
-    cache: Dict[int, Tuple[Optional[date], Optional[date]]],
-) -> int:
-    """
-    oldest(page) <= target 를 만족하는 가장 작은 page를 이진탐색.
-    실제 수집은 이 값을 anchor 로 쓰고, 주변에서 target이 걸치는 실제 window를 다시 찾는다.
-    """
-    lo = 1
-    r = hi
-    ans = hi
-
-    while lo <= r:
-        mid = (lo + r) // 2
-        _newest, oldest = get_page_date_range(session, mid, now_kst, cache)
-
-        if oldest is None:
-            ans = mid
-            r = mid - 1
-            continue
-
-        if oldest <= target:
-            ans = mid
-            r = mid - 1
-        else:
-            lo = mid + 1
-
-    return ans
-
-
-def find_target_window(
-    session: requests.Session,
-    target: date,
-    now_kst: datetime,
-    anchor_page: int,
-    cache: Dict[int, Tuple[Optional[date], Optional[date]]],
-) -> Tuple[int, int]:
-    """
-    anchor_page 주변에서 target 날짜가 실제로 걸치는 page window를 찾는다.
-    1) anchor 주변에서 target intersect page를 탐색
-    2) hit를 찾으면 좌우로 확장
-    """
-    hit_page: Optional[int] = None
-    max_radius = min(PAGE_WINDOW_MAX_EXPAND, MAX_PAGE_LIMIT)
-
-    for radius in range(0, max_radius + 1):
-        candidates = []
-        if radius == 0:
-            candidates = [anchor_page]
-        else:
-            left = anchor_page - radius
-            right = anchor_page + radius
-            if left >= 1:
-                candidates.append(left)
-            if right <= MAX_PAGE_LIMIT:
-                candidates.append(right)
-
-        for page in candidates:
-            if page_intersects_target(session, page, target, now_kst, cache):
-                hit_page = page
-                break
-
-        if hit_page is not None and radius >= TARGET_PAGE_SEARCH_RADIUS:
-            break
-        if hit_page is not None and radius >= 2:
-            break
-
-    if hit_page is None:
-        # 비정상 케이스: intersect page를 못 찾으면 anchor 주변 넓은 구간을 그냥 스캔
-        left = max(1, anchor_page - PAGE_WINDOW_MARGIN)
-        right = min(MAX_PAGE_LIMIT, anchor_page + PAGE_WINDOW_MARGIN)
-        return left, right
-
-    left = hit_page
-    while left > 1 and page_intersects_target(session, left - 1, target, now_kst, cache):
-        left -= 1
-
-    right = hit_page
-    while right < MAX_PAGE_LIMIT and page_intersects_target(session, right + 1, target, now_kst, cache):
-        right += 1
-
-    return left, right
-
-
-def collect_candidate_rows_for_date(
-    session: requests.Session,
-    target: date,
-    now_kst: datetime,
-    page_from: int,
-    page_to: int,
-) -> List[Tuple[PostRow, str, Optional[datetime]]]:
-    """
-    target 날짜가 들어 있을 법한 page window를 넓게 훑어서 후보를 모두 모은다.
-    조기 종료를 하지 않고, 지정 구간 전체를 스캔한 뒤 post_no로 dedupe 한다.
-    """
-    candidates: List[Tuple[PostRow, str, Optional[datetime]]] = []
-    seen_post_no: Set[int] = set()
-
-    for page in range(max(1, page_from), min(MAX_PAGE_LIMIT, page_to) + 1):
+    for page in range(1, MAX_PAGE_LIMIT + 1):
         page_url = build_list_url(page)
         html = fetch_html(session, page_url)
         rows = extract_rows(html, page_url)
+
         if not rows:
+            if passed_oldest_target_zone:
+                consecutive_pages_strictly_older += 1
+                if consecutive_pages_strictly_older >= STOP_OLDER_CONSECUTIVE_PAGES:
+                    print(f"[STOP] 빈 페이지가 연속 발생하여 page={page}에서 종료")
+                    break
+            jitter_sleep(SLEEP_LIST)
             continue
 
+        page_newest, page_oldest = robust_page_main_range(rows, now_kst)
+        if page_newest is not None and page_oldest is not None:
+            if page_oldest <= oldest_target:
+                passed_oldest_target_zone = True
+
+            if passed_oldest_target_zone and page_newest < oldest_target:
+                consecutive_pages_strictly_older += 1
+            else:
+                consecutive_pages_strictly_older = 0
+        else:
+            if passed_oldest_target_zone:
+                consecutive_pages_strictly_older += 1
+
+        if page == 1 or page % PAGE_PROGRESS_EVERY == 0 or (page_newest and page_newest <= newest_target):
+            print(
+                f"[PAGE {page}] main_range={page_newest}..{page_oldest} "
+                f"older_streak={consecutive_pages_strictly_older}"
+            )
+
+        # 이 페이지의 행들 중 target date에 해당하는 글만 후보로 처리
         for r in rows:
             if r.is_notice:
                 continue
 
-            dt_guess, d_guess = parse_list_date_or_datetime(r.date_text, r.date_attr, now_kst)
+            dt_guess, d_guess = row_created_date(r, now_kst)
             row_date = dt_guess.date() if dt_guess else d_guess
-            if row_date != target:
+            if row_date is None or row_date not in target_set:
                 continue
 
-            if r.post_no in seen_post_no:
+            if r.post_no in seen_post_no_by_date[row_date]:
                 continue
-            seen_post_no.add(r.post_no)
-            candidates.append((r, page_url, dt_guess))
+            if r.url in seen_url_by_date[row_date]:
+                continue
+
+            seen_post_no_by_date[row_date].add(r.post_no)
+            seen_url_by_date[row_date].add(r.url)
+            candidate_count_by_date[row_date] += 1
+
+            dt: Optional[datetime]
+            if dt_guess is not None:
+                dt = dt_guess
+            else:
+                if r.url in post_dt_cache:
+                    dt = post_dt_cache[r.url]
+                else:
+                    jitter_sleep(SLEEP_POST)
+                    post_html = fetch_html(session, r.url, referer=page_url)
+                    dt = parse_datetime_from_post(post_html, preferred_date=row_date)
+                    if dt is not None:
+                        post_dt_cache[r.url] = dt
+
+            if dt is None:
+                continue
+
+            t = dt.timetz().replace(tzinfo=None)
+            if start_t <= t <= end_t:
+                results_by_date[row_date].append((dt, r.title, r.url))
+
+        if page % PAGE_PROGRESS_EVERY == 0:
+            summary = ", ".join(
+                f"{d}:{len(results_by_date[d])}/{candidate_count_by_date[d]}"
+                for d in sorted(target_dates)
+            )
+            if summary:
+                print(f"[INFO] 누적 수집/후보 @page {page}: {summary}")
+
+        if passed_oldest_target_zone and consecutive_pages_strictly_older >= STOP_OLDER_CONSECUTIVE_PAGES:
+            print(
+                f"[STOP] page {page} 이후로 대표 날짜가 {oldest_target}보다 오래된 페이지가 "
+                f"{STOP_OLDER_CONSECUTIVE_PAGES}연속이라 종료"
+            )
+            break
 
         jitter_sleep(SLEEP_LIST)
 
-    candidates.sort(key=lambda x: x[0].post_no, reverse=True)
-    return candidates
+    for d in sorted(target_dates):
+        dedup: Dict[Tuple[datetime, str], str] = {}
+        for dt, title, url in results_by_date[d]:
+            dedup[(dt, url)] = title
+        results_by_date[d] = sorted(
+            [(dt, title, url) for (dt, url), title in dedup.items()],
+            key=lambda x: x[0],
+        )
+        print(f"[OK] {d} 후보 {candidate_count_by_date[d]}건 / 최종 {len(results_by_date[d])}건")
 
-
-def scrape_one_date(
-    session: requests.Session,
-    target: date,
-    start_t: dtime,
-    end_t: dtime,
-    now_kst: datetime,
-    page_from: int,
-    page_to: int,
-) -> List[Tuple[datetime, str, str]]:
-    results: List[Tuple[datetime, str, str]] = []
-    post_dt_cache: Dict[str, datetime] = {}
-
-    candidates = collect_candidate_rows_for_date(
-        session=session,
-        target=target,
-        now_kst=now_kst,
-        page_from=page_from,
-        page_to=page_to,
-    )
-    print(f"[INFO] {target} 후보 글 {len(candidates)}건 (scan_pages={page_from}..{page_to})")
-
-    for idx, (r, referer_page_url, dt_guess) in enumerate(candidates, start=1):
-        if dt_guess is None:
-            if r.url in post_dt_cache:
-                dt = post_dt_cache[r.url]
-            else:
-                jitter_sleep(SLEEP_POST)
-                post_html = fetch_html(session, r.url, referer=referer_page_url)
-                dt = parse_datetime_from_post(post_html, preferred_date=target)
-                if dt is None:
-                    continue
-                post_dt_cache[r.url] = dt
-        else:
-            dt = dt_guess
-
-        t = dt.timetz().replace(tzinfo=None)
-        if start_t <= t <= end_t:
-            results.append((dt, r.title, r.url))
-
-        if idx % 100 == 0:
-            print(f"[INFO] {target} 상세 확인 진행 {idx}/{len(candidates)}")
-
-    results.sort(key=lambda x: x[0])
-    return results
+    return results_by_date
 
 
 def main():
@@ -619,30 +559,15 @@ def main():
         print("[DONE] 모든 날짜가 개설일 이전이라 빈 CSV만 생성했습니다.")
         return
 
-    for target in sorted(target_dates, reverse=True):
-        fresh_now_kst = datetime.now(KST)
-        hi, cache = find_upper_bound_for_min_date(session, target, fresh_now_kst)
-        anchor_page = find_start_page_for_date(session, target, fresh_now_kst, hi, cache)
-        win_left, win_right = find_target_window(session, target, fresh_now_kst, anchor_page, cache)
-        scan_from = max(1, win_left - PAGE_WINDOW_MARGIN)
-        scan_to = min(MAX_PAGE_LIMIT, win_right + PAGE_WINDOW_MARGIN)
-
-        print(
-            f"\n=== {target} anchor={anchor_page}, target_window={win_left}..{win_right}, "
-            f"scan={scan_from}..{scan_to}, hi={hi} ==="
-        )
-
-        rows = scrape_one_date(
-            session=session,
-            target=target,
-            start_t=start_t,
-            end_t=end_t,
-            now_kst=fresh_now_kst,
-            page_from=scan_from,
-            page_to=scan_to,
-        )
-        all_results_by_date[target] = rows
-        print(f"[OK] {target} 수집 {len(rows)}건")
+    scanned_results = scan_pages_for_targets(
+        session=session,
+        target_dates=sorted(target_dates),
+        requested_dates=requested_dates,
+        start_t=start_t,
+        end_t=end_t,
+        now_kst=now_kst,
+    )
+    all_results_by_date.update(scanned_results)
 
     for d in requested_dates:
         out_path = os.path.join(OUT_DIR, f"{OUT_PREFIX}_{d.isoformat()}.csv")
