@@ -19,6 +19,7 @@ KST = ZoneInfo("Asia/Seoul")
 
 BASE_LIST_URL = "https://gall.dcinside.com/mgallery/board/lists/"
 BOARD_ID = os.getenv("BOARD_ID", "kospi")
+OUT_PREFIX = os.getenv("OUT_PREFIX", BOARD_ID)
 
 # 수집 시간대 (KST)
 START_TIME_STR = os.getenv("START_TIME", "08:50")
@@ -31,22 +32,23 @@ TARGET_DATE_STR = os.getenv("TARGET_DATE", "").strip()
 DATES_FILE = os.getenv("DATES_FILE", "date.txt")
 
 # 페이지/부하 제어
-LIST_NUM = int(os.getenv("LIST_NUM", "100"))  # 30/50/100 중 하나(기본 100 추천)
-MAX_PAGE_LIMIT = int(os.getenv("MAX_PAGE_LIMIT", "20000"))  # 안전 상한
-START_PAGE_BACKTRACK = int(os.getenv("START_PAGE_BACKTRACK", "15"))  # 활발한 갤러리는 페이지가 빨리 밀리므로 여유분 확보
-
+LIST_NUM = int(os.getenv("LIST_NUM", "100"))
+MAX_PAGE_LIMIT = int(os.getenv("MAX_PAGE_LIMIT", "20000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
-SLEEP_LIST = float(os.getenv("SLEEP_LIST", "0.8"))  # list 페이지 간 sleep
-SLEEP_POST = float(os.getenv("SLEEP_POST", "0.5"))  # 상세 페이지 간 sleep
-
+SLEEP_LIST = float(os.getenv("SLEEP_LIST", "0.7"))
+SLEEP_POST = float(os.getenv("SLEEP_POST", "0.45"))
 OUT_DIR = os.getenv("OUT_DIR", "outputs")
 
-# User-Agent (봇 차단 완화에 도움)
+# kospi 같이 활발한 갤에서 경계 페이지를 안정적으로 포착하기 위한 여유값
+TARGET_PAGE_SEARCH_RADIUS = int(os.getenv("TARGET_PAGE_SEARCH_RADIUS", "80"))
+PAGE_WINDOW_MARGIN = int(os.getenv("PAGE_WINDOW_MARGIN", "25"))
+PAGE_WINDOW_MAX_EXPAND = int(os.getenv("PAGE_WINDOW_MAX_EXPAND", "200"))
+
 USER_AGENT = os.getenv(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
 )
 
 DEFAULT_HEADERS = {
@@ -55,6 +57,8 @@ DEFAULT_HEADERS = {
     "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
 
 
@@ -89,14 +93,11 @@ def ensure_dir(path: str) -> None:
 
 def clean_title(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
-    s = re.sub(r"\[\d+\]\s*$", "", s).strip()  # 제목 끝 댓글수 [12] 제거
+    s = re.sub(r"\[\d+\]\s*$", "", s).strip()
     return s
 
 
 def build_list_url(page: int) -> str:
-    """
-    DCInside mgallery list URL 생성: id/page/list_num
-    """
     parts = urlsplit(BASE_LIST_URL)
     qs = parse_qs(parts.query)
     qs["id"] = [BOARD_ID]
@@ -113,9 +114,6 @@ def make_session() -> requests.Session:
 
 
 def fetch_html(session: requests.Session, url: str, referer: Optional[str] = None) -> str:
-    """
-    재시도 + 백오프 fetch
-    """
     last_err: Optional[Exception] = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -127,7 +125,6 @@ def fetch_html(session: requests.Session, url: str, referer: Optional[str] = Non
             if resp.status_code == 200 and resp.text:
                 return resp.text
 
-            # 차단/레이트리밋 가능 코드들
             if resp.status_code in (403, 429, 500, 502, 503, 504):
                 last_err = RuntimeError(f"HTTP {resp.status_code}")
                 jitter_sleep(1.2 * attempt)
@@ -144,9 +141,6 @@ def fetch_html(session: requests.Session, url: str, referer: Optional[str] = Non
 
 
 def extract_open_date_from_list(html: str) -> Optional[date]:
-    """
-    리스트 페이지 텍스트에서 '개설일 2020-02-11' 추출
-    """
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(" ", strip=True)
     m = re.search(r"개설일\s*(\d{4}-\d{2}-\d{2})", text)
@@ -159,29 +153,16 @@ def extract_open_date_from_list(html: str) -> Optional[date]:
 
 
 def _pick_main_table(soup: BeautifulSoup):
-    """
-    '제목/글쓴이/작성일' 키워드를 가진 table을 우선 선택 (구조 변경에도 어느정도 견딤)
-    """
     tables = soup.find_all("table")
     for t in tables:
-        thead_text = ""
         thead = t.find("thead")
-        if thead:
-            thead_text = thead.get_text(" ", strip=True)
-        else:
-            thead_text = t.get_text(" ", strip=True)[:200]
-
+        thead_text = thead.get_text(" ", strip=True) if thead else t.get_text(" ", strip=True)[:250]
         if ("제목" in thead_text) and ("작성일" in thead_text) and ("글쓴이" in thead_text):
             return t
     return tables[0] if tables else None
 
 
 def extract_rows(html: str, page_url: str) -> List[PostRow]:
-    """
-    리스트 페이지에서:
-    - 글 번호(숫자)인 행만 추출 (AD/설문은 '-'라서 자연스럽게 제외)
-    - 제목/링크/작성일 텍스트(+가능하면 title attr의 전체 timestamp)
-    """
     soup = BeautifulSoup(html, "lxml")
     table = _pick_main_table(soup)
     if not table:
@@ -250,12 +231,6 @@ def extract_rows(html: str, page_url: str) -> List[PostRow]:
 
 
 def parse_full_datetime(s: str) -> Optional[datetime]:
-    """
-    DCInside에서 흔히 보이는 전체 timestamp 파싱:
-    - 2026.02.28 07:55:28
-    - 2026-02-28 07:55:28
-    - 2026-02-28 07:55
-    """
     s = s.strip()
     m = re.fullmatch(
         r"(\d{4})[.\-](\d{2})[.\-](\d{2})\s+([0-2]\d):([0-5]\d)(?::([0-5]\d))?",
@@ -274,12 +249,6 @@ def parse_full_datetime(s: str) -> Optional[datetime]:
 def parse_list_date_or_datetime(
     date_text: str, date_attr: Optional[str], now_kst: datetime
 ) -> Tuple[Optional[datetime], Optional[date]]:
-    """
-    (dt, d) 반환:
-    - dt: 시간까지 확정된 경우 (오늘 HH:MM, 혹은 attr로 전체 timestamp 확보)
-    - d : 날짜만 아는 경우 (YY.MM.DD / YYYY.MM.DD / MM.DD 등)
-    """
-    # 1) attr에 전체 timestamp가 있으면 최우선
     if date_attr:
         dt = parse_full_datetime(date_attr)
         if dt:
@@ -287,28 +256,27 @@ def parse_list_date_or_datetime(
 
     s = re.sub(r"\s+", " ", date_text.strip())
 
-    # 2) HH:MM -> 오늘 날짜로 결합
     if re.fullmatch(r"\d{1,2}:\d{2}", s):
         h, m = map(int, s.split(":"))
         return datetime.combine(now_kst.date(), dtime(h, m), tzinfo=KST), None
 
-    # 3) YY.MM.DD
     if re.fullmatch(r"\d{2}\.\d{2}\.\d{2}", s):
         yy, mo, d = map(int, s.split("."))
         return None, date(2000 + yy, mo, d)
 
-    # 4) YYYY.MM.DD
     if re.fullmatch(r"\d{4}\.\d{2}\.\d{2}", s):
         try:
             return None, datetime.strptime(s, "%Y.%m.%d").date()
         except ValueError:
             return None, None
 
-    # 5) MM.DD -> 올해 기준 + 롤오버 보정
     if re.fullmatch(r"\d{2}\.\d{2}", s):
         mo, d = map(int, s.split("."))
         y = now_kst.year
-        candidate = date(y, mo, d)
+        try:
+            candidate = date(y, mo, d)
+        except ValueError:
+            return None, None
         if candidate > now_kst.date():
             candidate = date(y - 1, mo, d)
         return None, candidate
@@ -316,37 +284,32 @@ def parse_list_date_or_datetime(
     return None, None
 
 
-def parse_datetime_from_post(html: str) -> Optional[datetime]:
-    """
-    글 상세에서 'YYYY.MM.DD HH:MM:SS' 패턴을 텍스트 기반으로 추출
-    """
+def parse_datetime_from_post(html: str, preferred_date: Optional[date] = None) -> Optional[datetime]:
     soup = BeautifulSoup(html, "lxml")
     text = soup.get_text(" ", strip=True)
 
-    m = re.search(r"(\d{4}\.\d{2}\.\d{2})\s+([0-2]\d:[0-5]\d:[0-5]\d)", text)
-    if m:
+    candidates: List[datetime] = []
+    for m in re.finditer(
+        r"(\d{4})[.\-](\d{2})[.\-](\d{2})\s+([0-2]\d):([0-5]\d)(?::([0-5]\d))?",
+        text,
+    ):
+        y, mo, d, hh, mm, ss = m.groups()
+        sec = int(ss) if ss is not None else 0
         try:
-            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y.%m.%d %H:%M:%S")
-            return dt.replace(tzinfo=KST)
+            dt = datetime(int(y), int(mo), int(d), int(hh), int(mm), sec, tzinfo=KST)
+            candidates.append(dt)
         except ValueError:
-            pass
+            continue
 
-    m = re.search(r"(\d{4}\.\d{2}\.\d{2})\s+([0-2]\d:[0-5]\d)", text)
-    if m:
-        try:
-            dt = datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y.%m.%d %H:%M")
-            return dt.replace(tzinfo=KST)
-        except ValueError:
-            pass
+    if preferred_date is not None:
+        for dt in candidates:
+            if dt.date() == preferred_date:
+                return dt
 
-    return None
+    return candidates[0] if candidates else None
 
 
 def load_dates_from_file(path: str) -> List[date]:
-    """
-    date.txt에서 각 줄 첫 토큰이 YYYY-MM-DD인 것만 읽음
-    (BOM 제거를 위해 utf-8-sig 사용)
-    """
     dates: List[date] = []
     if not os.path.exists(path):
         raise FileNotFoundError(f"날짜 파일을 찾지 못했습니다: {path}")
@@ -368,9 +331,6 @@ def load_dates_from_file(path: str) -> List[date]:
 
 
 def write_csv(out_path: str, rows: List[Tuple[datetime, str, str]]) -> None:
-    """
-    rows: (작성시간(KST), 제목, URL)
-    """
     rows_sorted = sorted(rows, key=lambda x: x[0])
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
@@ -386,7 +346,8 @@ def get_page_date_range(
     cache: Dict[int, Tuple[Optional[date], Optional[date]]],
 ) -> Tuple[Optional[date], Optional[date]]:
     """
-    페이지의 (첫 글 날짜, 마지막 글 날짜)만 뽑아서 반환 (이진탐색용)
+    페이지에서 (가장 최신 날짜, 가장 오래된 날짜)를 반환한다.
+    순서가 약간 흔들리더라도 max/min으로 계산해 경계 탐색을 안정화한다.
     """
     if page in cache:
         return cache[page]
@@ -408,24 +369,36 @@ def get_page_date_range(
         cache[page] = (None, None)
         return None, None
 
-    cache[page] = (d_list[0], d_list[-1])
-    return d_list[0], d_list[-1]
+    newest = max(d_list)
+    oldest = min(d_list)
+    cache[page] = (newest, oldest)
+    return newest, oldest
+
+
+def page_intersects_target(
+    session: requests.Session,
+    page: int,
+    target: date,
+    now_kst: datetime,
+    cache: Dict[int, Tuple[Optional[date], Optional[date]]],
+) -> bool:
+    newest, oldest = get_page_date_range(session, page, now_kst, cache)
+    if newest is None or oldest is None:
+        return False
+    return newest >= target >= oldest
 
 
 def find_upper_bound_for_min_date(
     session: requests.Session, min_date: date, now_kst: datetime
 ) -> Tuple[int, Dict[int, Tuple[Optional[date], Optional[date]]]]:
-    """
-    min_date(가장 과거 목표 날짜)까지 도달 가능한 hi 페이지를 지수적으로 탐색
-    """
     cache: Dict[int, Tuple[Optional[date], Optional[date]]] = {}
 
     hi = 1
     while hi <= MAX_PAGE_LIMIT:
-        _first_d, last_d = get_page_date_range(session, hi, now_kst, cache)
-        if last_d is None:
+        _newest, oldest = get_page_date_range(session, hi, now_kst, cache)
+        if oldest is None:
             return hi, cache
-        if last_d <= min_date:
+        if oldest <= min_date:
             return hi, cache
         hi *= 2
 
@@ -440,7 +413,8 @@ def find_start_page_for_date(
     cache: Dict[int, Tuple[Optional[date], Optional[date]]],
 ) -> int:
     """
-    last_date(page) <= target 를 만족하는 가장 작은 page를 이진탐색
+    oldest(page) <= target 를 만족하는 가장 작은 page를 이진탐색.
+    실제 수집은 이 값을 anchor 로 쓰고, 주변에서 target이 걸치는 실제 window를 다시 찾는다.
     """
     lo = 1
     r = hi
@@ -448,14 +422,14 @@ def find_start_page_for_date(
 
     while lo <= r:
         mid = (lo + r) // 2
-        _first, last_d = get_page_date_range(session, mid, now_kst, cache)
+        _newest, oldest = get_page_date_range(session, mid, now_kst, cache)
 
-        if last_d is None:
+        if oldest is None:
             ans = mid
             r = mid - 1
             continue
 
-        if last_d <= target:
+        if oldest <= target:
             ans = mid
             r = mid - 1
         else:
@@ -464,29 +438,80 @@ def find_start_page_for_date(
     return ans
 
 
+def find_target_window(
+    session: requests.Session,
+    target: date,
+    now_kst: datetime,
+    anchor_page: int,
+    cache: Dict[int, Tuple[Optional[date], Optional[date]]],
+) -> Tuple[int, int]:
+    """
+    anchor_page 주변에서 target 날짜가 실제로 걸치는 page window를 찾는다.
+    1) anchor 주변에서 target intersect page를 탐색
+    2) hit를 찾으면 좌우로 확장
+    """
+    hit_page: Optional[int] = None
+    max_radius = min(PAGE_WINDOW_MAX_EXPAND, MAX_PAGE_LIMIT)
+
+    for radius in range(0, max_radius + 1):
+        candidates = []
+        if radius == 0:
+            candidates = [anchor_page]
+        else:
+            left = anchor_page - radius
+            right = anchor_page + radius
+            if left >= 1:
+                candidates.append(left)
+            if right <= MAX_PAGE_LIMIT:
+                candidates.append(right)
+
+        for page in candidates:
+            if page_intersects_target(session, page, target, now_kst, cache):
+                hit_page = page
+                break
+
+        if hit_page is not None and radius >= TARGET_PAGE_SEARCH_RADIUS:
+            break
+        if hit_page is not None and radius >= 2:
+            break
+
+    if hit_page is None:
+        # 비정상 케이스: intersect page를 못 찾으면 anchor 주변 넓은 구간을 그냥 스캔
+        left = max(1, anchor_page - PAGE_WINDOW_MARGIN)
+        right = min(MAX_PAGE_LIMIT, anchor_page + PAGE_WINDOW_MARGIN)
+        return left, right
+
+    left = hit_page
+    while left > 1 and page_intersects_target(session, left - 1, target, now_kst, cache):
+        left -= 1
+
+    right = hit_page
+    while right < MAX_PAGE_LIMIT and page_intersects_target(session, right + 1, target, now_kst, cache):
+        right += 1
+
+    return left, right
+
+
 def collect_candidate_rows_for_date(
     session: requests.Session,
     target: date,
     now_kst: datetime,
-    start_page: int,
+    page_from: int,
+    page_to: int,
 ) -> List[Tuple[PostRow, str, Optional[datetime]]]:
     """
-    날짜가 target인 후보 글을 먼저 "리스트 페이지만" 빠르게 수집한다.
-    (활발한 갤러리는 상세 페이지를 중간중간 열면 페이지가 밀려서 글을 놓치기 쉬움)
-    반환값: (PostRow, referer_page_url, dt_guess)
+    target 날짜가 들어 있을 법한 page window를 넓게 훑어서 후보를 모두 모은다.
+    조기 종료를 하지 않고, 지정 구간 전체를 스캔한 뒤 post_no로 dedupe 한다.
     """
     candidates: List[Tuple[PostRow, str, Optional[datetime]]] = []
     seen_post_no: Set[int] = set()
 
-    page = max(1, start_page)
-    while page <= MAX_PAGE_LIMIT:
+    for page in range(max(1, page_from), min(MAX_PAGE_LIMIT, page_to) + 1):
         page_url = build_list_url(page)
         html = fetch_html(session, page_url)
         rows = extract_rows(html, page_url)
         if not rows:
-            break
-
-        page_has_target = False
+            continue
 
         for r in rows:
             if r.is_notice:
@@ -494,29 +519,17 @@ def collect_candidate_rows_for_date(
 
             dt_guess, d_guess = parse_list_date_or_datetime(r.date_text, r.date_attr, now_kst)
             row_date = dt_guess.date() if dt_guess else d_guess
-            if row_date is None:
+            if row_date != target:
                 continue
 
-            if row_date > target:
-                continue
-
-            if row_date < target:
-                return candidates
-
-            # row_date == target
-            page_has_target = True
             if r.post_no in seen_post_no:
                 continue
             seen_post_no.add(r.post_no)
             candidates.append((r, page_url, dt_guess))
 
-        if not page_has_target and candidates:
-            # target 날짜를 이미 모았고, 현재 페이지엔 target이 하나도 없으면 종료
-            break
-
         jitter_sleep(SLEEP_LIST)
-        page += 1
 
+    candidates.sort(key=lambda x: x[0].post_no, reverse=True)
     return candidates
 
 
@@ -526,12 +539,9 @@ def scrape_one_date(
     start_t: dtime,
     end_t: dtime,
     now_kst: datetime,
-    start_page: int,
+    page_from: int,
+    page_to: int,
 ) -> List[Tuple[datetime, str, str]]:
-    """
-    1) 리스트 페이지를 먼저 빠르게 훑어 target 날짜 후보를 모두 수집
-    2) 그 다음에 상세 페이지를 열어 정확한 시간을 확인
-    """
     results: List[Tuple[datetime, str, str]] = []
     post_dt_cache: Dict[str, datetime] = {}
 
@@ -539,18 +549,19 @@ def scrape_one_date(
         session=session,
         target=target,
         now_kst=now_kst,
-        start_page=start_page,
+        page_from=page_from,
+        page_to=page_to,
     )
-    print(f"[INFO] {target} 후보 글 {len(candidates)}건 (start_page={start_page})")
+    print(f"[INFO] {target} 후보 글 {len(candidates)}건 (scan_pages={page_from}..{page_to})")
 
-    for r, referer_page_url, dt_guess in candidates:
+    for idx, (r, referer_page_url, dt_guess) in enumerate(candidates, start=1):
         if dt_guess is None:
             if r.url in post_dt_cache:
                 dt = post_dt_cache[r.url]
             else:
                 jitter_sleep(SLEEP_POST)
                 post_html = fetch_html(session, r.url, referer=referer_page_url)
-                dt = parse_datetime_from_post(post_html)
+                dt = parse_datetime_from_post(post_html, preferred_date=target)
                 if dt is None:
                     continue
                 post_dt_cache[r.url] = dt
@@ -561,6 +572,10 @@ def scrape_one_date(
         if start_t <= t <= end_t:
             results.append((dt, r.title, r.url))
 
+        if idx % 100 == 0:
+            print(f"[INFO] {target} 상세 확인 진행 {idx}/{len(candidates)}")
+
+    results.sort(key=lambda x: x[0])
     return results
 
 
@@ -570,7 +585,6 @@ def main():
     end_t = parse_hhmm(END_TIME_STR)
     ensure_dir(OUT_DIR)
 
-    # 1) 대상 날짜 확정
     if TARGET_DATE_STR:
         target_dates = [date.fromisoformat(TARGET_DATE_STR)]
         requested_dates = target_dates[:]
@@ -582,7 +596,6 @@ def main():
         print("대상 날짜가 없습니다. (date.txt를 확인하세요)")
         return
 
-    # 2) 갤러리 개설일 확인 후, 개설일 이전 날짜는 자동 스킵(빈 CSV 생성)
     session = make_session()
     first_page_html = fetch_html(session, build_list_url(1))
     open_date = extract_open_date_from_list(first_page_html)
@@ -593,49 +606,55 @@ def main():
         if skipped:
             print(f"[INFO] 갤러리 개설일({open_date}) 이전 날짜는 글이 없으므로 빈 CSV로 처리합니다. 예: {skipped[:5]}")
 
-    # 결과 딕셔너리(요청된 날짜는 모두 키로 보장)
     all_results_by_date: Dict[date, List[Tuple[datetime, str, str]]] = {d: [] for d in requested_dates}
 
-    # 3) 스크랩할 날짜가 하나도 없으면(전부 개설일 이전) 빈 CSV만 생성하고 종료
     if not target_dates:
         for d in requested_dates:
-            out_path = os.path.join(OUT_DIR, f"kospi_{d.isoformat()}.csv")
+            out_path = os.path.join(OUT_DIR, f"{OUT_PREFIX}_{d.isoformat()}.csv")
             write_csv(out_path, [])
-        combined_path = os.path.join(OUT_DIR, "kospi_all.csv")
+        combined_path = os.path.join(OUT_DIR, f"{OUT_PREFIX}_all.csv")
         with open(combined_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(["작성시간(KST)", "날짜", "제목", "URL"])
         print("[DONE] 모든 날짜가 개설일 이전이라 빈 CSV만 생성했습니다.")
         return
 
-    # 4) 날짜별 수집(신규→과거 순)
-    #    kospi처럼 활발한 갤은 page cache를 오래 들고 있으면 금방 stale 되므로
-    #    날짜별로 fresh 하게 hi/start_page를 다시 계산한다.
     for target in sorted(target_dates, reverse=True):
         fresh_now_kst = datetime.now(KST)
         hi, cache = find_upper_bound_for_min_date(session, target, fresh_now_kst)
-        raw_start_page = find_start_page_for_date(session, target, fresh_now_kst, hi, cache)
-        start_page = max(1, raw_start_page - START_PAGE_BACKTRACK)
+        anchor_page = find_start_page_for_date(session, target, fresh_now_kst, hi, cache)
+        win_left, win_right = find_target_window(session, target, fresh_now_kst, anchor_page, cache)
+        scan_from = max(1, win_left - PAGE_WINDOW_MARGIN)
+        scan_to = min(MAX_PAGE_LIMIT, win_right + PAGE_WINDOW_MARGIN)
 
-        print(f"\n=== {target} 시작 페이지(raw={raw_start_page}, adjusted={start_page}, hi={hi}) ===")
-        rows = scrape_one_date(session, target, start_t, end_t, fresh_now_kst, start_page)
+        print(
+            f"\n=== {target} anchor={anchor_page}, target_window={win_left}..{win_right}, "
+            f"scan={scan_from}..{scan_to}, hi={hi} ==="
+        )
+
+        rows = scrape_one_date(
+            session=session,
+            target=target,
+            start_t=start_t,
+            end_t=end_t,
+            now_kst=fresh_now_kst,
+            page_from=scan_from,
+            page_to=scan_to,
+        )
         all_results_by_date[target] = rows
         print(f"[OK] {target} 수집 {len(rows)}건")
 
-    # 5) 날짜별 CSV 저장(요청된 날짜는 모두 생성)
     for d in requested_dates:
-        out_path = os.path.join(OUT_DIR, f"kospi_{d.isoformat()}.csv")
+        out_path = os.path.join(OUT_DIR, f"{OUT_PREFIX}_{d.isoformat()}.csv")
         write_csv(out_path, all_results_by_date.get(d, []))
 
-    # 6) 합본 CSV도 생성
-    combined_path = os.path.join(OUT_DIR, "kospi_all.csv")
+    combined_path = os.path.join(OUT_DIR, f"{OUT_PREFIX}_all.csv")
     combined_rows: List[Tuple[datetime, str, str, str]] = []
     for d in requested_dates:
         for dt, title, url in all_results_by_date.get(d, []):
             combined_rows.append((dt, d.isoformat(), title, url))
 
     combined_rows.sort(key=lambda x: x[0])
-
     with open(combined_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(["작성시간(KST)", "날짜", "제목", "URL"])
