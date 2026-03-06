@@ -44,6 +44,7 @@ jobs:
           SLEEP_LIST: "0.9"
           SLEEP_POST: "0.6"
           MAX_RETRIES: "5"
+          START_PAGE_BACKTRACK: "15"
         run: |
           python main.py
           ls -al outputs || true
