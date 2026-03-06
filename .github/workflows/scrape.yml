@@ -44,7 +44,8 @@ jobs:
           SLEEP_LIST: "0.9"
           SLEEP_POST: "0.6"
           MAX_RETRIES: "5"
-          START_PAGE_BACKTRACK: "15"
+          TARGET_PAGE_SEARCH_RADIUS: "80"
+          PAGE_WINDOW_MARGIN: "25"
         run: |
           python main.py
           ls -al outputs || true
