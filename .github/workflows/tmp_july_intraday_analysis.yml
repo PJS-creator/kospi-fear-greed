@@ -1,0 +1,246 @@
+name: Temporary July 2026 intraday analysis
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Fetch and aggregate intraday data
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import math
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from collections import defaultdict
+          from datetime import datetime, time as dtime
+          from zoneinfo import ZoneInfo
+
+          KST = ZoneInfo("Asia/Seoul")
+          START_DT = datetime(2026, 7, 1, 0, 0, tzinfo=KST)
+          END_DT = datetime(2026, 7, 30, 0, 0, tzinfo=KST)
+          START = int(START_DT.timestamp())
+          END = int(END_DT.timestamp())
+          USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/138 Safari/537.36"
+
+          def finite_number(value):
+              if value is None:
+                  return None
+              try:
+                  value = float(value)
+              except (TypeError, ValueError):
+                  return None
+              return value if math.isfinite(value) else None
+
+          def get_json(url, attempts=4):
+              last_error = None
+              for attempt in range(attempts):
+                  req = urllib.request.Request(
+                      url,
+                      headers={
+                          "User-Agent": USER_AGENT,
+                          "Accept": "application/json,text/plain,*/*",
+                          "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+                          "Referer": "https://finance.yahoo.com/",
+                      },
+                  )
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as response:
+                          return json.loads(response.read().decode("utf-8"))
+                  except Exception as exc:
+                      last_error = f"{type(exc).__name__}: {exc}"
+                      time.sleep(1.5 * (attempt + 1))
+              raise RuntimeError(f"request failed: {last_error}; url={url}")
+
+          def fetch_yahoo(symbol):
+              encoded = urllib.parse.quote(symbol, safe="")
+              errors = []
+              for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+                  params = urllib.parse.urlencode(
+                      {
+                          "period1": START,
+                          "period2": END,
+                          "interval": "5m",
+                          "includePrePost": "false",
+                          "events": "div,splits",
+                      }
+                  )
+                  url = f"https://{host}/v8/finance/chart/{encoded}?{params}"
+                  try:
+                      payload = get_json(url)
+                      chart = payload.get("chart", {})
+                      if chart.get("error"):
+                          raise RuntimeError(str(chart["error"]))
+                      result = (chart.get("result") or [None])[0]
+                      if not result:
+                          raise RuntimeError("empty chart.result")
+                      timestamps = result.get("timestamp") or []
+                      quote = ((result.get("indicators") or {}).get("quote") or [{}])[0]
+                      opens = quote.get("open") or []
+                      highs = quote.get("high") or []
+                      lows = quote.get("low") or []
+                      closes = quote.get("close") or []
+                      volumes = quote.get("volume") or []
+                      n = min(len(timestamps), len(opens), len(highs), len(lows), len(closes))
+                      bars = []
+                      for i in range(n):
+                          o, h, l, c = map(finite_number, (opens[i], highs[i], lows[i], closes[i]))
+                          v = finite_number(volumes[i]) if i < len(volumes) else None
+                          if None in (o, h, l, c):
+                              continue
+                          dt = datetime.fromtimestamp(int(timestamps[i]), KST)
+                          if not (START_DT.date() <= dt.date() < END_DT.date()):
+                              continue
+                          if not (dtime(9, 0) <= dt.time() <= dtime(15, 30)):
+                              continue
+                          bars.append(
+                              {
+                                  "dt": dt,
+                                  "open": o,
+                                  "high": h,
+                                  "low": l,
+                                  "close": c,
+                                  "volume": max(v or 0.0, 0.0),
+                              }
+                          )
+                      if not bars:
+                          raise RuntimeError("no regular-session bars")
+                      meta = result.get("meta") or {}
+                      return {
+                          "symbol": symbol,
+                          "exchange_timezone": meta.get("exchangeTimezoneName"),
+                          "currency": meta.get("currency"),
+                          "bars": bars,
+                      }
+                  except Exception as exc:
+                      errors.append(f"{host}: {type(exc).__name__}: {exc}")
+              raise RuntimeError(" | ".join(errors))
+
+          def window_value(bars, start_t, end_t):
+              selected = [b for b in bars if start_t <= b["dt"].time() < end_t]
+              if not selected:
+                  return None, "missing", 0
+              total_volume = sum(b["volume"] for b in selected)
+              if total_volume > 0:
+                  value = sum(((b["high"] + b["low"] + b["close"]) / 3.0) * b["volume"] for b in selected) / total_volume
+                  return value, "vwap_typical", len(selected)
+              return sum(b["close"] for b in selected) / len(selected), "mean_close", len(selected)
+
+          def aggregate_days(fetched):
+              grouped = defaultdict(list)
+              for bar in fetched["bars"]:
+                  grouped[bar["dt"].date().isoformat()].append(bar)
+              rows = []
+              for date_key in sorted(grouped):
+                  bars = sorted(grouped[date_key], key=lambda x: x["dt"])
+                  if len(bars) < 20:
+                      continue
+                  open_bar = bars[0]
+                  close_bar = bars[-1]
+                  w10, m10, n10 = window_value(bars, dtime(10, 0), dtime(10, 30))
+                  w12, m12, n12 = window_value(bars, dtime(12, 0), dtime(12, 30))
+                  w14, m14, n14 = window_value(bars, dtime(14, 0), dtime(14, 30))
+                  if None in (w10, w12, w14):
+                      continue
+                  high_bar = max(bars, key=lambda x: x["high"])
+                  low_bar = min(bars, key=lambda x: x["low"])
+                  row = {
+                      "date": date_key,
+                      "bar_count": len(bars),
+                      "open_time": open_bar["dt"].strftime("%H:%M"),
+                      "close_time": close_bar["dt"].strftime("%H:%M"),
+                      "open": open_bar["open"],
+                      "t10_1030": w10,
+                      "t12_1230": w12,
+                      "t14_1430": w14,
+                      "close": close_bar["close"],
+                      "high": high_bar["high"],
+                      "high_time": high_bar["dt"].strftime("%H:%M"),
+                      "low": low_bar["low"],
+                      "low_time": low_bar["dt"].strftime("%H:%M"),
+                      "volume": sum(b["volume"] for b in bars),
+                      "window_methods": [m10, m12, m14],
+                      "window_counts": [n10, n12, n14],
+                  }
+                  rows.append(row)
+              previous_close = None
+              for row in rows:
+                  row["intraday_return_pct"] = (row["close"] / row["open"] - 1.0) * 100.0
+                  row["t10_return_pct"] = (row["t10_1030"] / row["open"] - 1.0) * 100.0
+                  row["t12_return_pct"] = (row["t12_1230"] / row["open"] - 1.0) * 100.0
+                  row["t14_return_pct"] = (row["t14_1430"] / row["open"] - 1.0) * 100.0
+                  if previous_close is None:
+                      row["gap_return_pct"] = None
+                      row["close_to_prev_pct"] = None
+                  else:
+                      row["gap_return_pct"] = (row["open"] / previous_close - 1.0) * 100.0
+                      row["close_to_prev_pct"] = (row["close"] / previous_close - 1.0) * 100.0
+                  five = {
+                      "시초가": row["open"],
+                      "10:00-10:30": row["t10_1030"],
+                      "12:00-12:30": row["t12_1230"],
+                      "14:00-14:30": row["t14_1430"],
+                      "종가": row["close"],
+                  }
+                  row["five_point_high"] = max(five, key=five.get)
+                  row["five_point_low"] = min(five, key=five.get)
+                  row["open_is_exact_session_high"] = abs(row["open"] - row["high"]) <= max(1e-9, abs(row["high"]) * 1e-10)
+                  previous_close = row["close"]
+              return rows
+
+          asset_candidates = {
+              "KOSPI200": ["^KS200", "KOSPI200.KS", "069500.KS"],
+              "삼성전자": ["005930.KS"],
+              "SK하이닉스": ["000660.KS"],
+          }
+          output = {
+              "analysis_period_kst": [START_DT.date().isoformat(), "2026-07-29"],
+              "bar_interval": "5m",
+              "window_definition": "Stocks/index use volume-weighted typical price when volume is available; otherwise mean 5-minute close. Windows are half-open [10:00,10:30), [12:00,12:30), [14:00,14:30).",
+              "assets": {},
+              "errors": {},
+          }
+
+          for label, candidates in asset_candidates.items():
+              candidate_errors = []
+              fetched = None
+              for symbol in candidates:
+                  try:
+                      fetched = fetch_yahoo(symbol)
+                      rows = aggregate_days(fetched)
+                      if len(rows) < 15:
+                          raise RuntimeError(f"only {len(rows)} valid sessions")
+                      output["assets"][label] = {
+                          "source": "Yahoo Finance chart API",
+                          "source_symbol": symbol,
+                          "is_proxy": label == "KOSPI200" and symbol == "069500.KS",
+                          "exchange_timezone": fetched["exchange_timezone"],
+                          "currency": fetched["currency"],
+                          "session_count": len(rows),
+                          "days": rows,
+                      }
+                      break
+                  except Exception as exc:
+                      candidate_errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
+              if label not in output["assets"]:
+                  output["errors"][label] = candidate_errors
+
+          print("RESULT_JSON_START")
+          print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
+          print("RESULT_JSON_END")
+
+          missing = set(asset_candidates) - set(output["assets"])
+          if missing:
+              raise SystemExit(f"Missing assets: {sorted(missing)}")
+          PY
