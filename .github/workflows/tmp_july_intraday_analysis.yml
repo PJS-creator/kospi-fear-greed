@@ -13,197 +13,124 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Install TradingView downloader
+      - name: Install dependencies
         run: |
           python -m pip install --quiet --upgrade pandas numpy websocket-client requests
           python -m pip install --quiet --upgrade --no-cache-dir git+https://github.com/rongardF/tvdatafeed.git
 
-      - name: Fetch and aggregate TradingView intraday data
+      - name: Fetch and aggregate 5-minute data
         shell: bash
         run: |
           python - <<'PY'
-          import json
-          import math
+          import json, math
           from collections import defaultdict
-          from datetime import date, datetime, time as dtime
-
+          from datetime import date, time as dtime
           import pandas as pd
           from tvDatafeed import TvDatafeed, Interval
 
-          START_DATE = date(2026, 7, 1)
-          END_DATE = date(2026, 7, 29)
-
-          def finite(value):
-              try:
-                  value = float(value)
-              except (TypeError, ValueError):
-                  return None
-              return value if math.isfinite(value) else None
-
+          START, END = date(2026,7,1), date(2026,7,29)
           tv = TvDatafeed()
-          assets = {
-              "삼성전자": [("005930", "KRX")],
-              "SK하이닉스": [("000660", "KRX")],
-              "KOSPI200": [("KOSPI200", "KRX"), ("KS200", "KRX"), ("KPI200", "KRX"), ("KOSPI200", "TVC")],
+          candidates = {
+              "삼성전자": [("005930","KRX")],
+              "SK하이닉스": [("000660","KRX")],
+              "KOSPI200": [("KOSPI200","KRX"),("KS200","KRX"),("KPI200","KRX"),("KOSPI200","TVC")],
           }
 
-          raw_assets = {}
-          errors = {}
-          searches = {}
+          def num(x):
+              try: x=float(x)
+              except: return None
+              return x if math.isfinite(x) else None
 
-          for label, candidates in assets.items():
-              candidate_errors = []
-              frame = None
-              chosen = None
-              for symbol, exchange in candidates:
+          def fetch(label, choices):
+              errs=[]
+              for symbol, exchange in choices:
                   try:
-                      df = tv.get_hist(
-                          symbol=symbol,
-                          exchange=exchange,
-                          interval=Interval.in_5_minute,
-                          n_bars=5000,
-                          extended_session=False,
-                      )
-                      if df is None or df.empty:
-                          raise RuntimeError("empty dataframe")
-                      frame = df.copy()
-                      chosen = {"symbol": symbol, "exchange": exchange}
-                      break
-                  except Exception as exc:
-                      candidate_errors.append(f"{exchange}:{symbol}: {type(exc).__name__}: {exc}")
-              if frame is None:
-                  try:
-                      searches[label] = tv.search_symbol("KOSPI200" if label == "KOSPI200" else candidates[0][0], "KRX")
-                  except Exception as exc:
-                      searches[label] = [f"search failed: {type(exc).__name__}: {exc}"]
-                  errors[label] = candidate_errors
-                  continue
+                      df=tv.get_hist(symbol=symbol, exchange=exchange, interval=Interval.in_5_minute,
+                                     n_bars=5000, extended_session=False)
+                      if df is not None and not df.empty:
+                          return df, {"symbol":symbol,"exchange":exchange}, errs
+                      errs.append(f"{exchange}:{symbol}: empty")
+                  except Exception as e:
+                      errs.append(f"{exchange}:{symbol}: {type(e).__name__}: {e}")
+              return None, None, errs
 
-              if candidate_errors:
-                  errors[label] = candidate_errors
-              raw_assets[label] = {"chosen": chosen, "frame": frame}
-
-          def normalize_frame(df):
-              out = []
-              for idx, row in df.iterrows():
-                  if isinstance(idx, pd.Timestamp):
-                      ts = idx
-                  else:
-                      ts = pd.Timestamp(idx)
-                  if ts.tzinfo is not None:
-                      ts = ts.tz_convert("Asia/Seoul").tz_localize(None)
-                  dt = ts.to_pydatetime()
-                  if not (START_DATE <= dt.date() <= END_DATE):
-                      continue
-                  if not (dtime(9, 0) <= dt.time() <= dtime(15, 30)):
-                      continue
-                  o, h, l, c, v = (finite(row.get(k)) for k in ("open", "high", "low", "close", "volume"))
-                  if None in (o, h, l, c):
-                      continue
-                  out.append({"dt": dt, "open": o, "high": h, "low": l, "close": c, "volume": max(v or 0.0, 0.0)})
-              unique = {b["dt"]: b for b in out}
-              return sorted(unique.values(), key=lambda b: b["dt"])
-
-          def window_value(bars, start_t, end_t):
-              selected = [b for b in bars if start_t <= b["dt"].time() < end_t]
-              if not selected:
-                  return None, 0
-              volume = sum(b["volume"] for b in selected)
-              if volume > 0:
-                  value = sum(((b["high"] + b["low"] + b["close"]) / 3.0) * b["volume"] for b in selected) / volume
+          def to_bars(df):
+              idx=pd.DatetimeIndex(df.index)
+              # tvDatafeed emits timezone-naive UTC timestamps on the GitHub runner.
+              if idx.tz is None:
+                  idx=idx.tz_localize("UTC").tz_convert("Asia/Seoul").tz_localize(None)
               else:
-                  value = sum(b["close"] for b in selected) / len(selected)
-              return value, len(selected)
+                  idx=idx.tz_convert("Asia/Seoul").tz_localize(None)
+              bars=[]
+              for dt, (_,r) in zip(idx, df.iterrows()):
+                  py=dt.to_pydatetime()
+                  if not (START <= py.date() <= END): continue
+                  if not (dtime(9,0) <= py.time() <= dtime(15,30)): continue
+                  o,h,l,c,v=(num(r.get(k)) for k in ("open","high","low","close","volume"))
+                  if None in (o,h,l,c): continue
+                  bars.append({"dt":py,"open":o,"high":h,"low":l,"close":c,"volume":max(v or 0,0)})
+              return sorted({b["dt"]:b for b in bars}.values(), key=lambda b:b["dt"])
+
+          def win(bars,a,z):
+              s=[b for b in bars if a <= b["dt"].time() < z]
+              if not s:return None,0
+              vol=sum(b["volume"] for b in s)
+              if vol>0:
+                  val=sum(((b["high"]+b["low"]+b["close"])/3)*b["volume"] for b in s)/vol
+              else: val=sum(b["close"] for b in s)/len(s)
+              return val,len(s)
 
           def aggregate(bars):
-              grouped = defaultdict(list)
-              for bar in bars:
-                  grouped[bar["dt"].date().isoformat()].append(bar)
-              rows = []
-              for date_key in sorted(grouped):
-                  day_bars = sorted(grouped[date_key], key=lambda b: b["dt"])
-                  if len(day_bars) < 30:
-                      continue
-                  w10, n10 = window_value(day_bars, dtime(10, 0), dtime(10, 30))
-                  w12, n12 = window_value(day_bars, dtime(12, 0), dtime(12, 30))
-                  w14, n14 = window_value(day_bars, dtime(14, 0), dtime(14, 30))
-                  if None in (w10, w12, w14):
-                      continue
-                  first, last = day_bars[0], day_bars[-1]
-                  high_bar = max(day_bars, key=lambda b: b["high"])
-                  low_bar = min(day_bars, key=lambda b: b["low"])
-                  row = {
-                      "date": date_key,
-                      "bar_count": len(day_bars),
-                      "open_time": first["dt"].strftime("%H:%M"),
-                      "close_time": last["dt"].strftime("%H:%M"),
-                      "open": first["open"],
-                      "t10_1030": w10,
-                      "t12_1230": w12,
-                      "t14_1430": w14,
-                      "close": last["close"],
-                      "high": high_bar["high"],
-                      "high_time": high_bar["dt"].strftime("%H:%M"),
-                      "low": low_bar["low"],
-                      "low_time": low_bar["dt"].strftime("%H:%M"),
-                      "window_counts": [n10, n12, n14],
-                  }
-                  rows.append(row)
-              prev_close = None
-              for row in rows:
-                  row["intraday_return_pct"] = (row["close"] / row["open"] - 1.0) * 100.0
-                  row["t10_return_pct"] = (row["t10_1030"] / row["open"] - 1.0) * 100.0
-                  row["t12_return_pct"] = (row["t12_1230"] / row["open"] - 1.0) * 100.0
-                  row["t14_return_pct"] = (row["t14_1430"] / row["open"] - 1.0) * 100.0
-                  row["gap_return_pct"] = None if prev_close is None else (row["open"] / prev_close - 1.0) * 100.0
-                  row["close_to_prev_pct"] = None if prev_close is None else (row["close"] / prev_close - 1.0) * 100.0
-                  five = {
-                      "시초가": row["open"],
-                      "10:00-10:30": row["t10_1030"],
-                      "12:00-12:30": row["t12_1230"],
-                      "14:00-14:30": row["t14_1430"],
-                      "종가": row["close"],
-                  }
-                  row["five_point_high"] = max(five, key=five.get)
-                  row["five_point_low"] = min(five, key=five.get)
-                  row["open_is_session_high"] = abs(row["open"] - row["high"]) <= max(1e-9, abs(row["high"]) * 1e-10)
-                  prev_close = row["close"]
+              g=defaultdict(list)
+              for b in bars:g[b["dt"].date().isoformat()].append(b)
+              rows=[]
+              for ds in sorted(g):
+                  b=sorted(g[ds],key=lambda x:x["dt"])
+                  if len(b)<30:continue
+                  x10,n10=win(b,dtime(10,0),dtime(10,30)); x12,n12=win(b,dtime(12,0),dtime(12,30)); x14,n14=win(b,dtime(14,0),dtime(14,30))
+                  if None in (x10,x12,x14):continue
+                  hi=max(b,key=lambda x:x["high"]); lo=min(b,key=lambda x:x["low"])
+                  r={"date":ds,"bar_count":len(b),"open_time":b[0]["dt"].strftime("%H:%M"),"close_time":b[-1]["dt"].strftime("%H:%M"),
+                     "open":b[0]["open"],"t10_1030":x10,"t12_1230":x12,"t14_1430":x14,"close":b[-1]["close"],
+                     "high":hi["high"],"high_time":hi["dt"].strftime("%H:%M"),"low":lo["low"],"low_time":lo["dt"].strftime("%H:%M"),
+                     "window_counts":[n10,n12,n14]}
+                  rows.append(r)
+              prev=None
+              for r in rows:
+                  o=r["open"]
+                  r["t10_return_pct"]=(r["t10_1030"]/o-1)*100; r["t12_return_pct"]=(r["t12_1230"]/o-1)*100
+                  r["t14_return_pct"]=(r["t14_1430"]/o-1)*100; r["intraday_return_pct"]=(r["close"]/o-1)*100
+                  r["gap_return_pct"]=None if prev is None else (o/prev-1)*100
+                  r["close_to_prev_pct"]=None if prev is None else (r["close"]/prev-1)*100
+                  five={"시초가":o,"10:00-10:30":r["t10_1030"],"12:00-12:30":r["t12_1230"],"14:00-14:30":r["t14_1430"],"종가":r["close"]}
+                  r["five_point_high"]=max(five,key=five.get); r["five_point_low"]=min(five,key=five.get)
+                  r["open_is_session_high"]=abs(o-r["high"])<=max(1e-9,abs(r["high"])*1e-10)
+                  prev=r["close"]
               return rows
 
-          output = {
-              "analysis_period_kst": [START_DATE.isoformat(), END_DATE.isoformat()],
-              "bar_interval": "5m",
-              "window_definition": "Half-open windows [10:00,10:30), [12:00,12:30), [14:00,14:30), using volume-weighted typical price when volume is available.",
-              "assets": {},
-              "errors": errors,
-              "searches": searches,
-          }
-
-          for label, data in raw_assets.items():
-              bars = normalize_frame(data["frame"])
-              rows = aggregate(bars)
-              output["assets"][label] = {
-                  "source": "TradingView historical bars via tvDatafeed",
-                  "source_symbol": data["chosen"],
-                  "session_count": len(rows),
-                  "raw_bar_count_in_period": len(bars),
-                  "days": rows,
-              }
-
-          with open("intraday_result.json", "w", encoding="utf-8") as f:
-              json.dump(output, f, ensure_ascii=False, indent=2, default=str)
-
-          print("sessions:", {k: v["session_count"] for k, v in output["assets"].items()})
-          print("symbols:", {k: v["source_symbol"] for k, v in output["assets"].items()})
-          print("errors:", errors)
-          print("searches:", searches)
+          out={"analysis_period_kst":[str(START),str(END)],"bar_interval":"5m",
+               "window_definition":"[10:00,10:30), [12:00,12:30), [14:00,14:30); volume-weighted typical price",
+               "assets":{},"errors":{}}
+          for label,choices in candidates.items():
+              df,sym,errs=fetch(label,choices)
+              if errs:out["errors"][label]=errs
+              if df is None:continue
+              bars=to_bars(df); rows=aggregate(bars)
+              out["assets"][label]={"source":"TradingView historical bars via tvDatafeed","source_symbol":sym,
+                                     "raw_index_first":str(df.index[0]),"raw_index_last":str(df.index[-1]),
+                                     "raw_bar_count_in_period":len(bars),"session_count":len(rows),"days":rows}
+          with open("intraday_result.json","w",encoding="utf-8") as f:json.dump(out,f,ensure_ascii=False,indent=2)
+          print("sessions",{k:v["session_count"] for k,v in out["assets"].items()})
+          print("symbols",{k:v["source_symbol"] for k,v in out["assets"].items()})
+          print("raw",{k:(v["raw_index_first"],v["raw_index_last"]) for k,v in out["assets"].items()})
+          print("errors",out["errors"])
           PY
 
       - name: Upload result
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: july-intraday-result-tv
+          name: july-intraday-result-tv-kst
           path: intraday_result.json
           if-no-files-found: error
           retention-days: 1
