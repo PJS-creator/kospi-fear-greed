@@ -1,0 +1,31 @@
+name: Temporary July intraday analysis
+
+on:
+  push:
+    branches:
+      - tmp-intraday-links-20260730
+    paths:
+      - .github/workflows/tmp-intraday-analysis.yml
+
+permissions:
+  contents: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout temporary branch
+        uses: actions/checkout@v4
+        with:
+          ref: tmp-intraday-links-20260730
+          fetch-depth: 1
+      - name: Run analysis
+        run: python tmp_intraday_analysis.py
+      - name: Commit temporary results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tmp_intraday_results.json tmp_intraday_results.md
+          git commit -m "Generate temporary July intraday results"
+          git push origin HEAD:tmp-intraday-links-20260730
