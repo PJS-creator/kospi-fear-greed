@@ -7,6 +7,7 @@ on:
     paths:
       - .github/workflows/tmp-intraday-analysis.yml
       - tmp_intraday_analysis.py
+      - tmp_intraday_analysis_yahoo.py
 
 permissions:
   contents: read
@@ -18,12 +19,12 @@ jobs:
     steps:
       - name: Checkout temporary pull request
         uses: actions/checkout@v4
-      - name: Run analysis
-        run: python tmp_intraday_analysis.py
+      - name: Run full-month analysis
+        run: python tmp_intraday_analysis_yahoo.py
       - name: Upload temporary results
         uses: actions/upload-artifact@v4
         with:
-          name: july-intraday-results
+          name: july-intraday-results-full-month
           path: |
             tmp_intraday_results.json
             tmp_intraday_results.md
