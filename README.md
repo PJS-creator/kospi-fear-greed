@@ -1,1 +1,0 @@
-# kospi-fear-greed
